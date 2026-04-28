@@ -2398,10 +2398,6 @@ def main():
     args = parse_arguments()
     if isinstance(args.image, str):
         args.image = [args.image]
-    if isinstance(args.audio, str):
-        args.audio = [args.audio]
-    if isinstance(args.video, str):
-        args.video = [args.video]
 
     model, processor = load(
         args.model,
@@ -2422,7 +2418,9 @@ def main():
     prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
-    num_audios = len(args.audio) if args.audio is not None else 0
+    num_audios = (
+        1 if args.audio is not None else 0
+    )  # TODO: Support multiple audio files
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
     if args.video:
@@ -2475,12 +2473,7 @@ def main():
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
             prompt = apply_chat_template(
-                processor,
-                config,
-                chat,
-                num_images=num_images,
-                num_audios=num_audios,
-                **chat_template_kwargs,
+                processor, config, chat, num_images=num_images, **chat_template_kwargs
             )
             response = ""
             print("Assistant:", end="")
