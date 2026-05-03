@@ -249,6 +249,32 @@ def parse_arguments():
         default=DEFAULT_THINKING_END_TOKEN,
         help="Token that marks the end of a thinking block (default: %(default)s).",
     )
+    parser.add_argument(
+        "--generate-audio",
+        action="store_true",
+        help="Generate MiniCPM-o speech tokens after text generation.",
+    )
+    parser.add_argument(
+        "--output-audio",
+        type=str,
+        default=None,
+        help="Optional WAV path for MiniCPM-o speech output.",
+    )
+    parser.add_argument(
+        "--token2wav-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path or HF repo for MiniCPM-o StepAudio2 token2wav assets "
+            "(default: mlx-community/Step-Audio-2-token2wav)."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-audio",
+        type=str,
+        default=None,
+        help="Prompt/reference WAV for the stepaudio2 vocoder.",
+    )
 
     return parser.parse_args()
 
@@ -373,6 +399,13 @@ class GenerationResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
+
+
+@dataclass
+class SpeechGenerationResult(GenerationResult):
+    audio_tokens: Optional[mx.array] = None
+    audio: Optional[bytes] = None
+    output_audio_path: Optional[str] = None
 
 
 class PromptCacheState:
@@ -1292,6 +1325,177 @@ def generate(
     )
 
 
+def generate_speech(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    prompt: str,
+    image: Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
+    verbose: bool = False,
+    output_audio_path: Optional[str] = None,
+    token2wav_path: Optional[str] = None,
+    prompt_audio_path: Optional[str] = None,
+    tts_max_tokens: int = 2048,
+    tts_min_tokens: int = 50,
+    tts_temperature: float = 0.8,
+    tts_top_p: float = 0.85,
+    tts_top_k: int = 25,
+    tts_repetition_penalty: float = 1.05,
+    **kwargs,
+) -> SpeechGenerationResult:
+    if not hasattr(model, "generate_speech_tokens"):
+        raise ValueError(f"{type(model).__name__} does not support speech generation.")
+
+    from .models.minicpmo.tts import TTSSamplingParams
+    from .models.minicpmo.vocoder import StepAudio2Vocoder
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+    add_special_tokens = (
+        getattr(processor, "chat_template", None) is None
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+        else True
+    )
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    image_token_index = getattr(model.config, "image_token_index", None)
+
+    inputs = prepare_inputs(
+        processor,
+        images=image,
+        audio=audio,
+        videos=video,
+        prompts=prompt,
+        image_token_index=image_token_index,
+        resize_shape=resize_shape,
+        add_special_tokens=add_special_tokens,
+        **kwargs,
+    )
+    input_ids = inputs.get("input_ids", None)
+    pixel_values = inputs.get("pixel_values", None)
+    mask = inputs.get("attention_mask", None)
+    data_kwargs = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+
+    generation_kwargs = dict(kwargs)
+    generation_kwargs.update(data_kwargs)
+    generation_kwargs["prompt_cache"] = cache.make_prompt_cache(
+        model.language_model,
+        max_kv_size=generation_kwargs.get("max_kv_size", None),
+    )
+
+    text = ""
+    generated_tokens: list[int] = []
+    last_response = None
+    detokenizer = processor.detokenizer
+    detokenizer.reset()
+    tic = time.perf_counter()
+    total_prompt_tokens = input_ids.size
+
+    with wired_limit(model, [generation_stream]):
+        gen = generate_step(input_ids, model, pixel_values, mask, **generation_kwargs)
+        for n, (token, logprobs) in enumerate(gen):
+            if n == 0:
+                prompt_time = time.perf_counter() - tic
+                prompt_tps = total_prompt_tokens / prompt_time
+                tic = time.perf_counter()
+
+            token_id = int(token)
+            generated_tokens.append(token_id)
+            if tokenizer.stopping_criteria(token_id):
+                break
+
+            detokenizer.add_token(token_id)
+            segment = detokenizer.last_segment
+            text += segment
+            if verbose:
+                print(segment, end="", flush=True)
+            last_response = GenerationResult(
+                text=segment,
+                token=token_id,
+                logprobs=logprobs,
+                prompt_tokens=total_prompt_tokens,
+                generation_tokens=n + 1,
+                total_tokens=total_prompt_tokens + n + 1,
+                prompt_tps=prompt_tps,
+                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
+
+        detokenizer.finalize()
+        text += detokenizer.last_segment
+        if verbose and detokenizer.last_segment:
+            print(detokenizer.last_segment, end="", flush=True)
+
+    if last_response is None:
+        last_response = GenerationResult(text=text, prompt_tokens=total_prompt_tokens)
+
+    full_input_ids = mx.concatenate(
+        [input_ids, mx.array(generated_tokens, dtype=input_ids.dtype)[None, :]],
+        axis=1,
+    )
+
+    tts_start_id = getattr(
+        tokenizer,
+        "tts_start_id",
+        tokenizer.convert_tokens_to_ids("<|tts_bos|>"),
+    )
+    tts_end_id = getattr(
+        tokenizer,
+        "tts_end_id",
+        tokenizer.convert_tokens_to_ids("<|tts_eos|>"),
+    )
+    sampling_params = TTSSamplingParams(
+        top_p=tts_top_p,
+        top_k=tts_top_k,
+        repetition_penalty=tts_repetition_penalty,
+        temperature=tts_temperature,
+    )
+    audio_tokens = model.generate_speech_tokens(
+        full_input_ids,
+        pixel_values=pixel_values,
+        mask=mask,
+        tts_start_id=tts_start_id,
+        tts_end_id=tts_end_id,
+        tts_sampling_params=sampling_params,
+        tts_min_new_token=tts_min_tokens,
+        tts_max_new_token=tts_max_tokens,
+        **data_kwargs,
+    )
+
+    wav_bytes = None
+    if output_audio_path is not None:
+        if prompt_audio_path is None:
+            if isinstance(audio, list) and len(audio) > 0 and isinstance(audio[0], str):
+                prompt_audio_path = audio[0]
+            elif isinstance(audio, str):
+                prompt_audio_path = audio
+        vocoder = StepAudio2Vocoder(token2wav_path)
+        wav_bytes = vocoder.decode(
+            audio_tokens,
+            prompt_wav_path=prompt_audio_path,
+            output_audio_path=output_audio_path,
+        )
+
+    return SpeechGenerationResult(
+        text=text,
+        token=last_response.token,
+        logprobs=last_response.logprobs,
+        prompt_tokens=total_prompt_tokens,
+        generation_tokens=len(generated_tokens),
+        total_tokens=total_prompt_tokens + len(generated_tokens),
+        prompt_tps=last_response.prompt_tps,
+        generation_tps=last_response.generation_tps,
+        peak_memory=mx.get_peak_memory() / 1e9,
+        audio_tokens=audio_tokens,
+        audio=wav_bytes,
+        output_audio_path=output_audio_path,
+    )
+
+
 @dataclass
 class BatchGenerationResult:
     """
@@ -1747,7 +1951,7 @@ class PromptProcessingBatch:
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
-        left_padding = [max_length - l for l in lengths]
+        left_padding = [max_length - length for length in lengths]
         self._total_prompt_tokens = sum(lengths)
 
         self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
@@ -2169,7 +2373,6 @@ def batch_generate(
     from .utils import process_image
 
     processor.detokenizer.reset()
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
     # Handle single image case
     if isinstance(images, str):
@@ -2295,7 +2498,6 @@ def _generate_batch(
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:
 
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
 
     num_images_list = [
@@ -2424,7 +2626,10 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
+    generate_audio = args.generate_audio or args.output_audio is not None
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if generate_audio:
+        chat_template_kwargs["use_tts_template"] = True
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
@@ -2537,14 +2742,29 @@ def main():
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
-        result = generate(
-            model,
-            processor,
-            prompt,
-            **gen_kwargs,
-        )
+        if generate_audio:
+            result = generate_speech(
+                model,
+                processor,
+                prompt,
+                output_audio_path=args.output_audio,
+                token2wav_path=args.token2wav_path,
+                prompt_audio_path=args.prompt_audio,
+                **gen_kwargs,
+            )
+            if args.verbose and args.output_audio:
+                print(f"\nAudio written to {args.output_audio}")
+        else:
+            result = generate(
+                model,
+                processor,
+                prompt,
+                **gen_kwargs,
+            )
         if not args.verbose:
             print(result.text)
+            if generate_audio and args.output_audio:
+                print(f"Audio written to {args.output_audio}")
 
         if draft_model is not None:
             lens = getattr(draft_model, "accept_lens", None) or []

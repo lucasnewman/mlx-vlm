@@ -9,6 +9,7 @@ from ..qwen3_vl.language import LanguageModel
 from .audio import AudioModel, AudioProjector, check_conv1d_weight_shape
 from .config import ModelConfig
 from .processing_minicpmo import MiniCPMOProcessor  # noqa: F401
+from .tts import MiniCPMTTS, TTSSamplingParams, sanitize_tts_weights
 from .vision import VisionModel, check_array_shape
 
 
@@ -234,6 +235,10 @@ class Model(nn.Module):
         else:
             self.audio_tower = None
             self.audio_projection_layer = None
+        if config.init_tts and config.tts_config is not None:
+            self.tts = MiniCPMTTS(config.tts_config)
+        else:
+            self.tts = None
 
     @property
     def layers(self):
@@ -497,13 +502,136 @@ class Model(nn.Module):
             cache=cache,
         )
 
+    def get_hidden_states(
+        self,
+        input_ids: mx.array,
+        pixel_values: Optional[list] = None,
+        mask: Optional[mx.array] = None,
+        **kwargs,
+    ):
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+        outputs = self.language_model(
+            input_ids,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
+            mask=mask,
+            cache=None,
+            output_hidden_states=True,
+        )
+        return outputs.hidden_states
+
+    def find_tts_bound(
+        self,
+        input_ids: mx.array,
+        tts_start_id: int,
+        tts_end_id: int,
+    ) -> tuple[int, int]:
+        ids = _to_numpy(input_ids).reshape(-1)
+        start_positions = np.where(ids == tts_start_id)[0]
+        end_positions = np.where(ids == tts_end_id)[0]
+        if len(start_positions) == 0 or len(end_positions) == 0:
+            raise ValueError(
+                "Could not find <|tts_bos|> and <|tts_eos|> in the generated "
+                "sequence. Make sure the prompt was built with use_tts_template=True."
+            )
+
+        for start in reversed(start_positions):
+            valid_ends = end_positions[end_positions > start]
+            if len(valid_ends) > 0:
+                return int(start + 1), int(valid_ends[0])
+
+        raise ValueError("Found <|tts_bos|> but no following <|tts_eos|> token.")
+
+    def build_tts_input_embeddings(
+        self,
+        full_input_ids: mx.array,
+        hidden_states: mx.array,
+        tts_bound: tuple[int, int],
+    ) -> mx.array:
+        if self.tts is None:
+            raise ValueError("MiniCPM-o TTS module is not initialized.")
+        if self.tts.condition_type != "hidden_text_merge":
+            raise NotImplementedError(
+                f"Unsupported MiniCPM-o TTS condition type: {self.tts.condition_type}"
+            )
+
+        start, end = tts_bound
+        llm_tokens = full_input_ids[:, start:end]
+        llm_embeds = self.tts.emb_text(llm_tokens)
+        hidden_embeds = self.tts.projector_semantic(hidden_states[:, start:end, :])
+        if self.tts.config.normalize_projected_hidden:
+            denom = mx.linalg.norm(hidden_embeds, ord=2, axis=-1, keepdims=True)
+            hidden_embeds = hidden_embeds / mx.maximum(denom, mx.array(1e-12))
+
+        tts_embeds = llm_embeds + hidden_embeds
+        text_eos = mx.array([[self.tts.config.text_eos_token_id]], dtype=mx.int32)
+        audio_bos = mx.array([[self.tts.audio_bos_token_id]], dtype=mx.int32)
+        text_eos_embed = self.tts.emb_text(text_eos).astype(tts_embeds.dtype)
+        audio_bos_embed = self.tts.emb_text(audio_bos).astype(tts_embeds.dtype)
+        return mx.concatenate([tts_embeds, text_eos_embed, audio_bos_embed], axis=1)
+
+    def generate_speech_tokens(
+        self,
+        full_input_ids: mx.array,
+        pixel_values: Optional[list] = None,
+        mask: Optional[mx.array] = None,
+        tts_start_id: Optional[int] = None,
+        tts_end_id: Optional[int] = None,
+        tts_bound: Optional[tuple[int, int]] = None,
+        tts_proj_layer: int = -1,
+        tts_sampling_params: Optional[TTSSamplingParams] = None,
+        tts_min_new_token: int = 50,
+        tts_max_new_token: int = 2048,
+        **kwargs,
+    ) -> mx.array:
+        if self.tts is None:
+            raise ValueError("MiniCPM-o TTS module is not initialized.")
+        if full_input_ids.shape[0] != 1:
+            raise ValueError(
+                "MiniCPM-o speech generation currently supports batch size 1"
+            )
+
+        if tts_bound is None:
+            if tts_start_id is None or tts_end_id is None:
+                raise ValueError("tts_start_id and tts_end_id are required.")
+            tts_bound = self.find_tts_bound(full_input_ids, tts_start_id, tts_end_id)
+
+        hidden_states = self.get_hidden_states(
+            full_input_ids,
+            pixel_values=pixel_values,
+            mask=mask,
+            **kwargs,
+        )
+        selected_hidden = hidden_states[tts_proj_layer]
+        inputs_embeds = self.build_tts_input_embeddings(
+            full_input_ids,
+            selected_hidden,
+            tts_bound,
+        )
+        outputs = self.tts.generate(
+            inputs_embeds=inputs_embeds,
+            eos_token=self.tts.config.num_audio_tokens - 1,
+            min_new_token=tts_min_new_token,
+            max_new_token=tts_max_new_token,
+            sampling_params=tts_sampling_params,
+        )
+        return outputs.new_ids
+
     def sanitize(self, weights):
         sanitized_weights = {}
         in_proj_weight = None
         in_proj_bias = None
+        tts_weights = {}
 
         for key, value in weights.items():
-            if key.startswith(("tts.", "audio_avg_pooler.")):
+            if key.startswith("audio_avg_pooler."):
+                continue
+
+            if key.startswith("tts."):
+                tts_weights[key] = value
                 continue
 
             if key.startswith("llm."):
@@ -517,6 +645,9 @@ class Model(nn.Module):
             elif key.startswith("resampler."):
                 pass
             else:
+                continue
+
+            if "rotary_emb.inv_freq" in key:
                 continue
 
             if key == "resampler.attn.in_proj_weight":
@@ -554,6 +685,8 @@ class Model(nn.Module):
             sanitized_weights["resampler.attn.q_proj.bias"] = q_b
             sanitized_weights["resampler.attn.k_proj.bias"] = k_b
             sanitized_weights["resampler.attn.v_proj.bias"] = v_b
+
+        sanitized_weights.update(sanitize_tts_weights(tts_weights))
 
         if self.config.text_config.tie_word_embeddings:
             sanitized_weights.pop("language_model.lm_head.weight", None)
