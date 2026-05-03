@@ -1244,6 +1244,118 @@ class TestModels(unittest.TestCase):
             model.language_model, config.text_config.hidden_size
         )
 
+    def test_qwen3_5_text_and_multimodal_rope_paths(self):
+        from mlx_vlm.models import qwen3_5
+
+        class CallSpy:
+            def __init__(self, target):
+                self.target = target
+                self.calls = 0
+
+            def __call__(self, *args, **kwargs):
+                self.calls += 1
+                return self.target(*args, **kwargs)
+
+        text_config = qwen3_5.TextConfig(
+            model_type="qwen3_5",
+            hidden_size=32,
+            intermediate_size=64,
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            head_dim=8,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [1, 1, 0],
+                "rope_theta": 1000,
+                "partial_rotary_factor": 0.5,
+            },
+            full_attention_interval=2,
+        )
+        vision_config = qwen3_5.VisionConfig(
+            model_type="qwen3_5",
+            depth=1,
+            hidden_size=32,
+            intermediate_size=64,
+            out_hidden_size=32,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=16,
+            fullatt_block_indexes=[],
+            deepstack_visual_indexes=[],
+        )
+        config = qwen3_5.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_5",
+            image_token_id=120,
+            video_token_id=121,
+            image_token_index=120,
+            video_token_index=121,
+            vision_start_token_id=118,
+            vision_end_token_id=119,
+            vocab_size=text_config.vocab_size,
+        )
+        model = qwen3_5.Model(config)
+
+        attn = model.language_model.model.layers[1].self_attn
+        fast_rope = CallSpy(attn.rope)
+        explicit_rope = CallSpy(attn.rotary_emb)
+        attn.rope = fast_rope
+        attn.rotary_emb = explicit_rope
+
+        text_ids = mx.array([[10, 11, 12, 13]], dtype=mx.int32)
+        model.language_model._rope_deltas = mx.array([[3]], dtype=mx.int32)
+        text_features = model.get_input_embeddings(input_ids=text_ids)
+        self.assertIsNone(model.language_model._rope_deltas)
+        text_out = model.language_model(
+            text_ids,
+            inputs_embeds=text_features.inputs_embeds,
+            cache=model.language_model.make_cache(),
+        )
+        self.assertEqual(text_out.logits.shape, (1, 4, text_config.vocab_size))
+        self.assertEqual(fast_rope.calls, 2)
+        self.assertEqual(explicit_rope.calls, 0)
+
+        fast_rope.calls = 0
+        explicit_rope.calls = 0
+        image_ids = mx.array(
+            [[10, config.vision_start_token_id, 120, 120, 120, 120, 11, 12]],
+            dtype=mx.int32,
+        )
+        image_grid_thw = mx.array([[1, 4, 4]], dtype=mx.int32)
+        image_features = mx.random.normal((4, text_config.hidden_size))
+        multimodal_features = model.get_input_embeddings(
+            input_ids=image_ids,
+            pixel_values=mx.zeros((1,), dtype=mx.float32),
+            image_grid_thw=image_grid_thw,
+            cached_image_features=image_features,
+        )
+        self.assertIsNotNone(model.language_model._position_ids)
+        self.assertIsNotNone(model.language_model._rope_deltas)
+        multimodal_out = model.language_model(
+            image_ids,
+            inputs_embeds=multimodal_features.inputs_embeds,
+            image_grid_thw=image_grid_thw,
+            cache=model.language_model.make_cache(),
+        )
+        self.assertEqual(
+            multimodal_out.logits.shape, (1, image_ids.shape[1], text_config.vocab_size)
+        )
+        self.assertEqual(fast_rope.calls, 0)
+        self.assertEqual(explicit_rope.calls, 1)
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
