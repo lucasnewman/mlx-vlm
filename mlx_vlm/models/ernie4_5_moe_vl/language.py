@@ -4,6 +4,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -200,6 +201,14 @@ class Attention(nn.Module):
             base=args.rope_theta,
             mrope_section=self.mrope_section,
         )
+        self.rope = initialize_rope(
+            head_dim,
+            base=args.rope_theta,
+            traditional=True,
+            scaling_config=getattr(args, "rope_scaling", None)
+            or getattr(args, "rope_parameters", None),
+            max_position_embeddings=args.max_position_embeddings,
+        )
 
     def __call__(
         self,
@@ -223,11 +232,20 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        # Handle position IDs
         if position_ids is None:
-            offset = cache.offset if cache is not None else 0
-            position_ids = mx.arange(offset, offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
+
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache, scale=self.scale, mask=mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
 
         cos, sin = self.rotary_emb(values, position_ids)
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
@@ -636,7 +654,21 @@ class LanguageModel(nn.Module):
                 # for per-row position_ids + delta arithmetic.
                 cache_offsets = c0.offset
 
-        if position_ids is None and (mask is None or mask.ndim == 2):
+        needs_explicit_positions = (
+            position_ids is not None
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+            or mask is not None
+            or rope_deltas_kw is not None
+            or self._rope_deltas is not None
+            or cache_offsets is not None
+        )
+
+        if (
+            position_ids is None
+            and needs_explicit_positions
+            and (mask is None or mask.ndim == 2)
+        ):
             is_prefill = (
                 cache is None
                 or cache[0] is None

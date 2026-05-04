@@ -1244,6 +1244,454 @@ class TestModels(unittest.TestCase):
             model.language_model, config.text_config.hidden_size
         )
 
+    def test_qwen3_5_text_and_multimodal_rope_paths(self):
+        from mlx_vlm.models import qwen3_5
+
+        class CallSpy:
+            def __init__(self, target):
+                self.target = target
+                self.calls = 0
+
+            def __call__(self, *args, **kwargs):
+                self.calls += 1
+                return self.target(*args, **kwargs)
+
+        text_config = qwen3_5.TextConfig(
+            model_type="qwen3_5",
+            hidden_size=32,
+            intermediate_size=64,
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            head_dim=8,
+            rope_parameters={
+                "type": "default",
+                "mrope_section": [1, 1, 0],
+                "rope_theta": 1000,
+                "partial_rotary_factor": 0.5,
+            },
+            full_attention_interval=2,
+        )
+        vision_config = qwen3_5.VisionConfig(
+            model_type="qwen3_5",
+            depth=1,
+            hidden_size=32,
+            intermediate_size=64,
+            out_hidden_size=32,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=16,
+            fullatt_block_indexes=[],
+            deepstack_visual_indexes=[],
+        )
+        config = qwen3_5.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_5",
+            image_token_id=120,
+            video_token_id=121,
+            image_token_index=120,
+            video_token_index=121,
+            vision_start_token_id=118,
+            vision_end_token_id=119,
+            vocab_size=text_config.vocab_size,
+        )
+        model = qwen3_5.Model(config)
+
+        attn = model.language_model.model.layers[1].self_attn
+        fast_rope = CallSpy(attn.rope)
+        explicit_rope = CallSpy(attn.rotary_emb)
+        attn.rope = fast_rope
+        attn.rotary_emb = explicit_rope
+
+        text_ids = mx.array([[10, 11, 12, 13]], dtype=mx.int32)
+        model.language_model._rope_deltas = mx.array([[3]], dtype=mx.int32)
+        text_features = model.get_input_embeddings(input_ids=text_ids)
+        self.assertIsNone(model.language_model._rope_deltas)
+        text_out = model.language_model(
+            text_ids,
+            inputs_embeds=text_features.inputs_embeds,
+            cache=model.language_model.make_cache(),
+        )
+        self.assertEqual(text_out.logits.shape, (1, 4, text_config.vocab_size))
+        self.assertEqual(fast_rope.calls, 2)
+        self.assertEqual(explicit_rope.calls, 0)
+
+        fast_rope.calls = 0
+        explicit_rope.calls = 0
+        image_ids = mx.array(
+            [[10, config.vision_start_token_id, 120, 120, 120, 120, 11, 12]],
+            dtype=mx.int32,
+        )
+        image_grid_thw = mx.array([[1, 4, 4]], dtype=mx.int32)
+        image_features = mx.random.normal((4, text_config.hidden_size))
+        multimodal_features = model.get_input_embeddings(
+            input_ids=image_ids,
+            pixel_values=mx.zeros((1,), dtype=mx.float32),
+            image_grid_thw=image_grid_thw,
+            cached_image_features=image_features,
+        )
+        self.assertIsNotNone(model.language_model._position_ids)
+        self.assertIsNotNone(model.language_model._rope_deltas)
+        multimodal_out = model.language_model(
+            image_ids,
+            inputs_embeds=multimodal_features.inputs_embeds,
+            image_grid_thw=image_grid_thw,
+            cache=model.language_model.make_cache(),
+        )
+        self.assertEqual(
+            multimodal_out.logits.shape, (1, image_ids.shape[1], text_config.vocab_size)
+        )
+        self.assertEqual(fast_rope.calls, 0)
+        self.assertEqual(explicit_rope.calls, 1)
+
+    def test_representative_text_only_fast_rope_paths(self):
+        class CallSpy:
+            def __init__(self, target):
+                self.target = target
+                self.calls = 0
+
+            def __call__(self, *args, **kwargs):
+                self.calls += 1
+                return self.target(*args, **kwargs)
+
+        def assert_text_only_path(
+            name,
+            model,
+            fast_rope,
+            explicit_rope,
+            explicit_position_ids,
+            multimodal_input_ids,
+            image_grid_thw,
+            image_features,
+        ):
+            with self.subTest(name=name):
+                language_model = model.language_model
+                input_ids = mx.array([[10, 11, 12, 13]], dtype=mx.int32)
+                language_model._rope_deltas = mx.array([[5]], dtype=mx.int32)
+                if hasattr(language_model, "_position_ids"):
+                    language_model._position_ids = mx.ones((3, 1, 4), dtype=mx.int32)
+
+                features = model.get_input_embeddings(input_ids=input_ids)
+                self.assertIsNone(language_model._rope_deltas)
+                if hasattr(language_model, "_position_ids"):
+                    self.assertIsNone(language_model._position_ids)
+
+                original_get_rope_index = language_model.get_rope_index
+
+                def fail_get_rope_index(*args, **kwargs):
+                    raise AssertionError("text-only path called get_rope_index")
+
+                language_model.get_rope_index = fail_get_rope_index
+                try:
+                    out = language_model(
+                        input_ids,
+                        inputs_embeds=features.inputs_embeds,
+                    )
+                finally:
+                    language_model.get_rope_index = original_get_rope_index
+
+                self.assertEqual(
+                    out.logits.shape,
+                    (1, input_ids.shape[1], model.config.text_config.vocab_size),
+                )
+                self.assertGreater(fast_rope.calls, 0)
+                self.assertEqual(explicit_rope.calls, 0)
+
+                fast_rope.calls = 0
+                explicit_rope.calls = 0
+                out = language_model(
+                    input_ids,
+                    inputs_embeds=features.inputs_embeds,
+                    position_ids=explicit_position_ids,
+                )
+                self.assertEqual(
+                    out.logits.shape,
+                    (1, input_ids.shape[1], model.config.text_config.vocab_size),
+                )
+                self.assertEqual(fast_rope.calls, 0)
+                self.assertGreater(explicit_rope.calls, 0)
+
+                fast_rope.calls = 0
+                explicit_rope.calls = 0
+                multimodal_features = model.get_input_embeddings(
+                    input_ids=multimodal_input_ids,
+                    pixel_values=mx.zeros((1,), dtype=mx.float32),
+                    image_grid_thw=image_grid_thw,
+                    cached_image_features=image_features,
+                )
+                if hasattr(language_model, "_position_ids"):
+                    self.assertIsNotNone(language_model._position_ids)
+                out = language_model(
+                    multimodal_input_ids,
+                    inputs_embeds=multimodal_features.inputs_embeds,
+                    image_grid_thw=image_grid_thw,
+                )
+                self.assertEqual(
+                    out.logits.shape,
+                    (
+                        1,
+                        multimodal_input_ids.shape[1],
+                        model.config.text_config.vocab_size,
+                    ),
+                )
+                self.assertEqual(fast_rope.calls, 0)
+                self.assertGreater(explicit_rope.calls, 0)
+
+        from mlx_vlm.models import ernie4_5_moe_vl, glm4v, qwen2_vl, qwen3_vl
+
+        qwen2_text_config = qwen2_vl.TextConfig(
+            model_type="qwen2_vl",
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            rope_theta=1000,
+            rope_scaling={"type": "mrope", "mrope_section": [1, 1, 2]},
+            tie_word_embeddings=False,
+        )
+        qwen2_vision_config = qwen2_vl.VisionConfig(
+            model_type="qwen2_vl",
+            depth=1,
+            embed_dim=32,
+            hidden_size=32,
+            image_size=28,
+            num_heads=4,
+            patch_size=14,
+            mlp_ratio=2,
+            in_channels=3,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        qwen2_config = qwen2_vl.ModelConfig(
+            model_type="qwen2_vl",
+            text_config=qwen2_text_config,
+            vision_config=qwen2_vision_config,
+            image_token_id=120,
+            video_token_id=121,
+            vision_start_token_id=119,
+            vocab_size=qwen2_text_config.vocab_size,
+        )
+        qwen2_model = qwen2_vl.Model(qwen2_config)
+        qwen2_attn = qwen2_model.language_model.model.layers[0].self_attn
+        qwen2_fast_rope = CallSpy(qwen2_attn.rope)
+        qwen2_explicit_rope = CallSpy(qwen2_attn.rotary_emb)
+        qwen2_attn.rope = qwen2_fast_rope
+        qwen2_attn.rotary_emb = qwen2_explicit_rope
+        qwen2_position_ids = mx.broadcast_to(
+            mx.arange(4, dtype=mx.int32).reshape(1, 1, 4),
+            (3, 1, 4),
+        )
+        qwen2_image_ids = mx.array([[10, 119, 120, 120, 120, 120, 11]], dtype=mx.int32)
+        qwen2_image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        assert_text_only_path(
+            "qwen2_vl",
+            qwen2_model,
+            qwen2_fast_rope,
+            qwen2_explicit_rope,
+            qwen2_position_ids,
+            qwen2_image_ids,
+            qwen2_image_grid_thw,
+            mx.random.normal((4, qwen2_text_config.hidden_size)),
+        )
+
+        qwen3_text_config = qwen3_vl.TextConfig(
+            model_type="qwen3_vl_text",
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=8,
+            vocab_size=128,
+            rope_theta=1000,
+            max_position_embeddings=128,
+            tie_word_embeddings=False,
+            rope_scaling={"type": "default", "mrope_section": [1, 1, 0]},
+        )
+        qwen3_vision_config = qwen3_vl.VisionConfig(
+            model_type="qwen3_vl",
+            depth=1,
+            hidden_size=32,
+            intermediate_size=64,
+            out_hidden_size=32,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[],
+        )
+        qwen3_config = qwen3_vl.ModelConfig(
+            text_config=qwen3_text_config,
+            vision_config=qwen3_vision_config,
+            model_type="qwen3_vl",
+            image_token_id=120,
+            video_token_id=121,
+            image_token_index=120,
+            video_token_index=121,
+            vision_start_token_id=119,
+            vocab_size=qwen3_text_config.vocab_size,
+        )
+        qwen3_model = qwen3_vl.Model(qwen3_config)
+        qwen3_attn = qwen3_model.language_model.model.layers[0].self_attn
+        qwen3_fast_rope = CallSpy(qwen3_attn.rope)
+        qwen3_explicit_rope = CallSpy(qwen3_attn.rotary_emb)
+        qwen3_attn.rope = qwen3_fast_rope
+        qwen3_attn.rotary_emb = qwen3_explicit_rope
+        qwen3_position_ids = mx.broadcast_to(
+            mx.arange(4, dtype=mx.int32).reshape(1, 1, 4),
+            (3, 1, 4),
+        )
+        qwen3_image_ids = mx.array([[10, 119, 120, 120, 120, 120, 11]], dtype=mx.int32)
+        qwen3_image_grid_thw = mx.array([[1, 4, 4]], dtype=mx.int32)
+        assert_text_only_path(
+            "qwen3_vl",
+            qwen3_model,
+            qwen3_fast_rope,
+            qwen3_explicit_rope,
+            qwen3_position_ids,
+            qwen3_image_ids,
+            qwen3_image_grid_thw,
+            mx.random.normal((4, qwen3_text_config.hidden_size)),
+        )
+
+        glm_text_config = glm4v.TextConfig(
+            model_type="glm4v_text",
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=1000,
+            attention_bias=False,
+            partial_rotary_factor=1.0,
+            rope_scaling={"rope_type": "default", "mrope_section": [1, 1, 2]},
+        )
+        glm_vision_config = glm4v.VisionConfig(
+            model_type="glm4v",
+            depth=1,
+            hidden_size=32,
+            intermediate_size=64,
+            out_hidden_size=32,
+            num_heads=4,
+            patch_size=14,
+            image_size=28,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+        glm_config = glm4v.ModelConfig(
+            text_config=glm_text_config,
+            vision_config=glm_vision_config,
+            model_type="glm4v",
+            vocab_size=glm_text_config.vocab_size,
+            image_token_id=120,
+            video_token_id=121,
+            image_token_index=120,
+            video_token_index=121,
+            vision_start_token_id=119,
+        )
+        glm_model = glm4v.Model(glm_config)
+        glm_attn = glm_model.language_model.model.layers[0].self_attn
+        glm_fast_rope = CallSpy(glm_attn.rope)
+        glm_explicit_rope = CallSpy(glm_model.language_model.model.rotary_emb)
+        glm_attn.rope = glm_fast_rope
+        glm_model.language_model.model.rotary_emb = glm_explicit_rope
+        glm_position_ids = mx.broadcast_to(
+            mx.arange(4, dtype=mx.int32).reshape(1, 1, 4),
+            (3, 1, 4),
+        )
+        glm_image_ids = mx.array([[10, 119, 120, 120, 120, 120, 11]], dtype=mx.int32)
+        glm_image_grid_thw = mx.array([[1, 4, 4]], dtype=mx.int32)
+        assert_text_only_path(
+            "glm4v",
+            glm_model,
+            glm_fast_rope,
+            glm_explicit_rope,
+            glm_position_ids,
+            glm_image_ids,
+            glm_image_grid_thw,
+            mx.random.normal((4, glm_text_config.hidden_size)),
+        )
+
+        ernie_text_config = ernie4_5_moe_vl.TextConfig(
+            model_type="ernie4_5_moe_vl",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+            max_position_embeddings=128,
+            rope_theta=1000.0,
+            mrope_section=[1, 1, 2],
+            tie_word_embeddings=False,
+        )
+        ernie_vision_config = ernie4_5_moe_vl.VisionConfig(
+            embed_dim=32,
+            hidden_size=32,
+            num_heads=4,
+            patch_size=14,
+            spatial_merge_size=2,
+        )
+        ernie_config = ernie4_5_moe_vl.ModelConfig(
+            model_type="ernie4_5_moe_vl",
+            hidden_size=32,
+            pixel_hidden_size=32,
+            text_config=ernie_text_config,
+            vision_config=ernie_vision_config,
+            im_patch_id=120,
+            image_token_id=120,
+            video_token_id=121,
+            image_start_token_id=119,
+            vision_start_token_id=119,
+            vocab_size=ernie_text_config.vocab_size,
+        )
+        ernie_model = ernie4_5_moe_vl.Model(ernie_config)
+        ernie_attn = ernie_model.language_model.model.layers[0].self_attn
+        ernie_fast_rope = CallSpy(ernie_attn.rope)
+        ernie_explicit_rope = CallSpy(ernie_attn.rotary_emb)
+        ernie_attn.rope = ernie_fast_rope
+        ernie_attn.rotary_emb = ernie_explicit_rope
+        ernie_positions_1d = mx.arange(4, dtype=mx.int32).reshape(1, 4)
+        ernie_position_ids = mx.stack(
+            [ernie_positions_1d, ernie_positions_1d, ernie_positions_1d],
+            axis=-1,
+        )
+        ernie_image_ids = mx.array([[10, 119, 120, 120, 120, 120, 11]], dtype=mx.int32)
+        ernie_image_grid_thw = mx.array([[1, 4, 4]], dtype=mx.int32)
+        assert_text_only_path(
+            "ernie4_5_moe_vl",
+            ernie_model,
+            ernie_fast_rope,
+            ernie_explicit_rope,
+            ernie_position_ids,
+            ernie_image_ids,
+            ernie_image_grid_thw,
+            mx.random.normal((4, ernie_text_config.hidden_size)),
+        )
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 

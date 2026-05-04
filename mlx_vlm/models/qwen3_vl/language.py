@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.rope_utils import initialize_rope
 
 from ..base import (
     LanguageModelOutput,
@@ -133,6 +134,13 @@ class Attention(nn.Module):
             base=args.rope_theta,
             rope_scaling=self.rope_scaling,
         )
+        self.rope = initialize_rope(
+            head_dim,
+            base=args.rope_theta,
+            traditional=False,
+            scaling_config=self.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
+        )
 
     def __call__(
         self,
@@ -156,23 +164,30 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[-2]
-
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
-        cos, sin = self.rotary_emb(values, position_ids)
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache, scale=self.scale, mask=mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
+
+        kv_seq_len = keys.shape[-2]
+        kv_seq_len += cache.offset + 1 if cache is not None else 0
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
 
+        cos, sin = self.rotary_emb(values, position_ids)
         queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
@@ -526,19 +541,37 @@ class LanguageModel(nn.Module):
         # Use ``cache._idx`` — the Python-int token counter — instead of
         # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
-        cache_offset_array = None  # For per-sequence offsets in batch mode
+        cache_offsets = None
         if cache and cache[0] is not None:
             c0 = cache[0]
             cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
-            if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
-                cache_offset_array = c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
             rope_mask = None
 
-        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+        needs_explicit_positions = (
+            position_ids is not None
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+            or rope_mask is not None
+            or rope_deltas_kw is not None
+            or self._rope_deltas is not None
+            or cache_offsets is not None
+        )
+
+        if (
+            position_ids is None
+            and needs_explicit_positions
+            and (rope_mask is None or rope_mask.ndim == 2)
+        ):
             # Calculate RoPE index once per generation in the pre-fill stage only
             recalc_condition = (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
@@ -562,9 +595,9 @@ class LanguageModel(nn.Module):
                 batch_size, seq_length = inputs.shape
 
                 # Use per-sequence offsets if available (for batched generation)
-                if cache_offset_array is not None:
+                if cache_offsets is not None:
                     # Per-sequence cache offsets for continuous batching
-                    base_offset = cache_offset_array[:batch_size].reshape(-1, 1)
+                    base_offset = cache_offsets[:batch_size].reshape(-1, 1)
                 else:
                     base_offset = mx.array(cache_offset)
 
