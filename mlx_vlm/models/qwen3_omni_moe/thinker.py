@@ -143,6 +143,9 @@ class Thinker(nn.Module):
         deepstack_visual_embeds = None
         visual_embeds_multiscale = None
 
+        if pixel_values is None and pixel_values_videos is None:
+            self.language_model._rope_deltas = None
+
         if input_features is not None:
             audio_features = self.get_audio_features(
                 input_features,

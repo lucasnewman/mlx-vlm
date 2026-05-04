@@ -2,6 +2,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.rope_utils import initialize_rope
 
 from ..base import (
     LanguageModelOutput,
@@ -127,6 +128,13 @@ class Attention(nn.Module):
             base=args.rope_theta,
             rope_scaling=args.rope_scaling,
         )
+        self.rope = initialize_rope(
+            head_dim,
+            base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
+        )
 
     def __call__(
         self,
@@ -148,20 +156,25 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[-2]
-
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
-        cos, sin = self.rotary_emb(values, position_ids)
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache, scale=self.scale, mask=mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
 
         if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
+
+        cos, sin = self.rotary_emb(values, position_ids)
         queries, keys = apply_multimodal_rotary_pos_emb(
             queries, keys, cos, sin, unqueeze_dim=1
         )
@@ -477,7 +490,21 @@ class LanguageModel(nn.Module):
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
             rope_mask = None
 
-        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+        needs_explicit_positions = (
+            position_ids is not None
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+            or rope_mask is not None
+            or rope_deltas_kw is not None
+            or self._rope_deltas is not None
+            or cache_offsets is not None
+        )
+
+        if (
+            position_ids is None
+            and needs_explicit_positions
+            and (rope_mask is None or rope_mask.ndim == 2)
+        ):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
@@ -508,8 +535,13 @@ class LanguageModel(nn.Module):
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]
                 else:
+                    rope_deltas = (
+                        rope_deltas_kw
+                        if rope_deltas_kw is not None
+                        else self._rope_deltas
+                    )
                     delta = mx.array(
-                        cache_offset + self._rope_deltas if cache is not None else 0
+                        cache_offset + rope_deltas if cache is not None else 0
                     )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)

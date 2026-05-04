@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -135,6 +136,13 @@ class Attention(nn.Module):
             base=args.rope_theta,
             rope_scaling=self.rope_scaling,
         )
+        self.rope = initialize_rope(
+            head_dim,
+            base=args.rope_theta,
+            traditional=False,
+            scaling_config=self.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
+        )
 
     def __call__(
         self,
@@ -158,23 +166,30 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[-2]
-
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
-        cos, sin = self.rotary_emb(values, position_ids)
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache, scale=self.scale, mask=mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
+
+        kv_seq_len = keys.shape[-2]
+        kv_seq_len += cache.offset + 1 if cache is not None else 0
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
 
+        cos, sin = self.rotary_emb(values, position_ids)
         queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
@@ -593,7 +608,21 @@ class LanguageModel(nn.Module):
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
             rope_mask = None
 
-        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+        needs_explicit_positions = (
+            position_ids is not None
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+            or rope_mask is not None
+            or rope_deltas_kw is not None
+            or self._rope_deltas is not None
+            or cache_offsets is not None
+        )
+
+        if (
+            position_ids is None
+            and needs_explicit_positions
+            and (rope_mask is None or rope_mask.ndim == 2)
+        ):
             # Calculate RoPE index once per generation in the pre-fill stage only
             is_prefill = (
                 cache is None
