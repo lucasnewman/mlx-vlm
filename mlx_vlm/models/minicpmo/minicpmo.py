@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
@@ -11,6 +12,13 @@ from .config import ModelConfig
 from .processing_minicpmo import MiniCPMOProcessor  # noqa: F401
 from .tts import MiniCPMTTS, TTSSamplingParams, sanitize_tts_weights
 from .vision import VisionModel, check_array_shape
+
+
+@dataclass
+class MiniCPMOSpeechGenerationOutput:
+    audio_tokens: mx.array
+    audio: Optional[bytes] = None
+    output_audio_path: Optional[str] = None
 
 
 def _to_mx_array(value, dtype: Optional[mx.Dtype] = None):
@@ -619,6 +627,96 @@ class Model(nn.Module):
             sampling_params=tts_sampling_params,
         )
         return outputs.new_ids
+
+    @staticmethod
+    def _token_id(tokenizer, attr: str, token: str) -> int:
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is None:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id < 0:
+            raise ValueError(f"Could not resolve MiniCPM-o speech token {token!r}.")
+        return int(token_id)
+
+    @staticmethod
+    def _prompt_audio_path(audio, prompt_audio_path: Optional[str]) -> Optional[str]:
+        if prompt_audio_path is not None:
+            return prompt_audio_path
+        if isinstance(audio, list) and len(audio) > 0 and isinstance(audio[0], str):
+            return audio[0]
+        if isinstance(audio, str):
+            return audio
+        return None
+
+    def generate_speech(
+        self,
+        *,
+        input_ids: mx.array,
+        generated_tokens: list[int],
+        tokenizer,
+        pixel_values: Optional[list] = None,
+        mask: Optional[mx.array] = None,
+        audio=None,
+        output_audio_path: Optional[str] = None,
+        token2wav_path: Optional[str] = None,
+        prompt_audio_path: Optional[str] = None,
+        min_tokens: int = 50,
+        max_tokens: int = 2048,
+        temperature: float = 0.8,
+        top_p: float = 0.85,
+        top_k: int = 25,
+        repetition_penalty: float = 1.05,
+        **kwargs,
+    ) -> MiniCPMOSpeechGenerationOutput:
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                "MiniCPM-o speech generation currently supports batch size 1"
+            )
+
+        if len(generated_tokens) == 0:
+            full_input_ids = input_ids
+        else:
+            full_input_ids = mx.concatenate(
+                [
+                    input_ids,
+                    mx.array(generated_tokens, dtype=input_ids.dtype)[None, :],
+                ],
+                axis=1,
+            )
+
+        sampling_params = TTSSamplingParams(
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+        )
+        audio_tokens = self.generate_speech_tokens(
+            full_input_ids,
+            pixel_values=pixel_values,
+            mask=mask,
+            tts_start_id=self._token_id(tokenizer, "tts_start_id", "<|tts_bos|>"),
+            tts_end_id=self._token_id(tokenizer, "tts_end_id", "<|tts_eos|>"),
+            tts_sampling_params=sampling_params,
+            tts_min_new_token=min_tokens,
+            tts_max_new_token=max_tokens,
+            **kwargs,
+        )
+
+        wav_bytes = None
+        if output_audio_path is not None:
+            from .vocoder import StepAudio2Vocoder
+
+            vocoder = StepAudio2Vocoder(token2wav_path)
+            wav_bytes = vocoder.decode(
+                audio_tokens,
+                prompt_wav_path=self._prompt_audio_path(audio, prompt_audio_path),
+                output_audio_path=output_audio_path,
+            )
+
+        return MiniCPMOSpeechGenerationOutput(
+            audio_tokens=audio_tokens,
+            audio=wav_bytes,
+            output_audio_path=output_audio_path,
+        )
 
     def sanitize(self, weights):
         sanitized_weights = {}

@@ -2017,11 +2017,8 @@ def generate_speech(
     tts_repetition_penalty: float = 1.05,
     **kwargs,
 ) -> SpeechGenerationResult:
-    if not hasattr(model, "generate_speech_tokens"):
+    if not hasattr(model, "generate_speech"):
         raise ValueError(f"{type(model).__name__} does not support speech generation.")
-
-    from .models.minicpmo.tts import TTSSamplingParams
-    from .models.minicpmo.vocoder import StepAudio2Vocoder
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     tokenizer.stopping_criteria.reset(model.config.eos_token_id)
@@ -2106,52 +2103,24 @@ def generate_speech(
     if last_response is None:
         last_response = GenerationResult(text=text, prompt_tokens=total_prompt_tokens)
 
-    full_input_ids = mx.concatenate(
-        [input_ids, mx.array(generated_tokens, dtype=input_ids.dtype)[None, :]],
-        axis=1,
-    )
-
-    tts_start_id = getattr(
-        tokenizer,
-        "tts_start_id",
-        tokenizer.convert_tokens_to_ids("<|tts_bos|>"),
-    )
-    tts_end_id = getattr(
-        tokenizer,
-        "tts_end_id",
-        tokenizer.convert_tokens_to_ids("<|tts_eos|>"),
-    )
-    sampling_params = TTSSamplingParams(
+    speech_output = model.generate_speech(
+        input_ids=input_ids,
+        generated_tokens=generated_tokens,
+        tokenizer=tokenizer,
+        pixel_values=pixel_values,
+        mask=mask,
+        audio=audio,
+        output_audio_path=output_audio_path,
+        token2wav_path=token2wav_path,
+        prompt_audio_path=prompt_audio_path,
+        min_tokens=tts_min_tokens,
+        max_tokens=tts_max_tokens,
+        temperature=tts_temperature,
         top_p=tts_top_p,
         top_k=tts_top_k,
         repetition_penalty=tts_repetition_penalty,
-        temperature=tts_temperature,
-    )
-    audio_tokens = model.generate_speech_tokens(
-        full_input_ids,
-        pixel_values=pixel_values,
-        mask=mask,
-        tts_start_id=tts_start_id,
-        tts_end_id=tts_end_id,
-        tts_sampling_params=sampling_params,
-        tts_min_new_token=tts_min_tokens,
-        tts_max_new_token=tts_max_tokens,
         **data_kwargs,
     )
-
-    wav_bytes = None
-    if output_audio_path is not None:
-        if prompt_audio_path is None:
-            if isinstance(audio, list) and len(audio) > 0 and isinstance(audio[0], str):
-                prompt_audio_path = audio[0]
-            elif isinstance(audio, str):
-                prompt_audio_path = audio
-        vocoder = StepAudio2Vocoder(token2wav_path)
-        wav_bytes = vocoder.decode(
-            audio_tokens,
-            prompt_wav_path=prompt_audio_path,
-            output_audio_path=output_audio_path,
-        )
 
     return SpeechGenerationResult(
         text=text,
@@ -2163,9 +2132,9 @@ def generate_speech(
         prompt_tps=last_response.prompt_tps,
         generation_tps=last_response.generation_tps,
         peak_memory=mx.get_peak_memory() / 1e9,
-        audio_tokens=audio_tokens,
-        audio=wav_bytes,
-        output_audio_path=output_audio_path,
+        audio_tokens=speech_output.audio_tokens,
+        audio=speech_output.audio,
+        output_audio_path=speech_output.output_audio_path,
     )
 
 
