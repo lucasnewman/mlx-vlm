@@ -638,9 +638,9 @@ class Model(nn.Module):
         return int(token_id)
 
     @staticmethod
-    def _prompt_audio_path(audio, prompt_audio_path: Optional[str]) -> Optional[str]:
-        if prompt_audio_path is not None:
-            return prompt_audio_path
+    def _ref_audio_path(audio, ref_audio_path: Optional[str]) -> Optional[str]:
+        if ref_audio_path is not None:
+            return ref_audio_path
         if isinstance(audio, list) and len(audio) > 0 and isinstance(audio[0], str):
             return audio[0]
         if isinstance(audio, str):
@@ -657,8 +657,7 @@ class Model(nn.Module):
         mask: Optional[mx.array] = None,
         audio=None,
         output_audio_path: Optional[str] = None,
-        token2wav_path: Optional[str] = None,
-        prompt_audio_path: Optional[str] = None,
+        ref_audio_path: Optional[str] = None,
         min_tokens: int = 50,
         max_tokens: int = 2048,
         temperature: float = 0.8,
@@ -705,10 +704,10 @@ class Model(nn.Module):
         if output_audio_path is not None:
             from .vocoder import StepAudio2Vocoder
 
-            vocoder = StepAudio2Vocoder(token2wav_path)
+            vocoder = StepAudio2Vocoder()
             wav_bytes = vocoder.decode(
                 audio_tokens,
-                prompt_wav_path=self._prompt_audio_path(audio, prompt_audio_path),
+                prompt_wav_path=self._ref_audio_path(audio, ref_audio_path),
                 output_audio_path=output_audio_path,
             )
 

@@ -198,9 +198,8 @@ class TestMiniCPMOTTS(unittest.TestCase):
             },
         ):
             StepAudio2Vocoder()
-            StepAudio2Vocoder("custom-token2wav")
 
-        self.assertEqual(calls, [((), {}), (("custom-token2wav",), {})])
+        self.assertEqual(calls, [((), {})])
 
 
 if __name__ == "__main__":

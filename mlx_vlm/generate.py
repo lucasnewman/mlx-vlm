@@ -260,30 +260,16 @@ def parse_arguments():
         help="Token that marks the end of a thinking block (default: %(default)s).",
     )
     parser.add_argument(
-        "--generate-audio",
-        action="store_true",
-        help="Generate MiniCPM-o speech tokens after text generation.",
-    )
-    parser.add_argument(
         "--output-audio",
         type=str,
         default=None,
-        help="Optional WAV path for MiniCPM-o speech output.",
+        help="Optional output path for audio generation.",
     )
     parser.add_argument(
-        "--token2wav-path",
+        "--ref-audio",
         type=str,
         default=None,
-        help=(
-            "Optional path or HF repo for MiniCPM-o StepAudio2 token2wav assets "
-            "(default: mlx-community/Step-Audio-2-token2wav)."
-        ),
-    )
-    parser.add_argument(
-        "--prompt-audio",
-        type=str,
-        default=None,
-        help="Prompt/reference WAV for the stepaudio2 vocoder.",
+        help="Reference / prompt audio for audio generation.",
     )
 
     return parser.parse_args()
@@ -2007,8 +1993,7 @@ def generate_speech(
     video: Union[str, List[str]] = None,
     verbose: bool = False,
     output_audio_path: Optional[str] = None,
-    token2wav_path: Optional[str] = None,
-    prompt_audio_path: Optional[str] = None,
+    ref_audio_path: Optional[str] = None,
     tts_max_tokens: int = 2048,
     tts_min_tokens: int = 50,
     tts_temperature: float = 0.8,
@@ -2111,8 +2096,7 @@ def generate_speech(
         mask=mask,
         audio=audio,
         output_audio_path=output_audio_path,
-        token2wav_path=token2wav_path,
-        prompt_audio_path=prompt_audio_path,
+        ref_audio_path=ref_audio_path,
         min_tokens=tts_min_tokens,
         max_tokens=tts_max_tokens,
         temperature=tts_temperature,
@@ -2784,7 +2768,7 @@ class PromptProcessingBatch:
             left_padding = [0] * len(input_ids)
             self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
         else:
-            left_padding = [max_length - l for l in lengths]
+            left_padding = [max_length - length for length in lengths]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
@@ -3448,7 +3432,6 @@ class BatchGenerator:
                 continue
             full_len = len(full_ids[i])
             prefix_len = prefix_lens[i]
-            right_pad = right_pad_per_row[i]
             for k, v in kw.items():
                 if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
@@ -3724,7 +3707,7 @@ class BatchGenerator:
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
                     tic = time.perf_counter()
-                    nstep = self._prompt_batch.prompt_step()
+                    self._prompt_batch.prompt_step()
                     self._prompt_time_counter += time.perf_counter() - tic
                 else:
                     tic = time.perf_counter()
@@ -4143,7 +4126,7 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    generate_audio = args.generate_audio or args.output_audio is not None
+    generate_audio = args.output_audio is not None
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
     if generate_audio:
         chat_template_kwargs["use_tts_template"] = True
@@ -4265,8 +4248,7 @@ def main():
                 processor,
                 prompt,
                 output_audio_path=args.output_audio,
-                token2wav_path=args.token2wav_path,
-                prompt_audio_path=args.prompt_audio,
+                ref_audio_path=args.ref_audio,
                 **gen_kwargs,
             )
             if args.verbose and args.output_audio:

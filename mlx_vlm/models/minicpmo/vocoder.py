@@ -21,7 +21,6 @@ class StepAudio2Vocoder:
 
     def __init__(
         self,
-        model_path: Optional[str] = None,
         *,
         n_timesteps: int = 10,
     ):
@@ -33,12 +32,8 @@ class StepAudio2Vocoder:
                 "`mlx-audio` that exposes `mlx_audio.codec.models.stepaudio2`."
             ) from exc
 
-        self.model_path = model_path
         self.n_timesteps = n_timesteps
-        if model_path is None:
-            self._codec = StepAudio2Token2Wav.from_pretrained()
-        else:
-            self._codec = StepAudio2Token2Wav.from_pretrained(model_path)
+        self._codec = StepAudio2Token2Wav.from_pretrained()
 
     def decode(
         self,
