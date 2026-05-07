@@ -398,7 +398,7 @@ class GenerationResult:
 
 
 @dataclass
-class SpeechGenerationResult(GenerationResult):
+class AudioGenerationResult(GenerationResult):
     audio_tokens: Optional[mx.array] = None
     audio: Optional[bytes] = None
     output_audio_path: Optional[str] = None
@@ -1984,7 +1984,7 @@ def generate(
     )
 
 
-def generate_speech(
+def generate_audio(
     model: nn.Module,
     processor: PreTrainedTokenizer,
     prompt: str,
@@ -1994,16 +1994,10 @@ def generate_speech(
     verbose: bool = False,
     output_audio_path: Optional[str] = None,
     ref_audio_path: Optional[str] = None,
-    tts_max_tokens: int = 2048,
-    tts_min_tokens: int = 50,
-    tts_temperature: float = 0.8,
-    tts_top_p: float = 0.85,
-    tts_top_k: int = 25,
-    tts_repetition_penalty: float = 1.05,
     **kwargs,
-) -> SpeechGenerationResult:
-    if not hasattr(model, "generate_speech"):
-        raise ValueError(f"{type(model).__name__} does not support speech generation.")
+) -> AudioGenerationResult:
+    if not hasattr(model, "generate_audio"):
+        raise ValueError(f"{type(model).__name__} does not support audio generation.")
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     tokenizer.stopping_criteria.reset(model.config.eos_token_id)
@@ -2088,7 +2082,9 @@ def generate_speech(
     if last_response is None:
         last_response = GenerationResult(text=text, prompt_tokens=total_prompt_tokens)
 
-    speech_output = model.generate_speech(
+    audio_generation_kwargs = dict(kwargs)
+    audio_generation_kwargs.update(data_kwargs)
+    audio_output = model.generate_audio(
         input_ids=input_ids,
         generated_tokens=generated_tokens,
         tokenizer=tokenizer,
@@ -2097,16 +2093,10 @@ def generate_speech(
         audio=audio,
         output_audio_path=output_audio_path,
         ref_audio_path=ref_audio_path,
-        min_tokens=tts_min_tokens,
-        max_tokens=tts_max_tokens,
-        temperature=tts_temperature,
-        top_p=tts_top_p,
-        top_k=tts_top_k,
-        repetition_penalty=tts_repetition_penalty,
-        **data_kwargs,
+        **audio_generation_kwargs,
     )
 
-    return SpeechGenerationResult(
+    return AudioGenerationResult(
         text=text,
         token=last_response.token,
         logprobs=last_response.logprobs,
@@ -2116,9 +2106,9 @@ def generate_speech(
         prompt_tps=last_response.prompt_tps,
         generation_tps=last_response.generation_tps,
         peak_memory=mx.get_peak_memory() / 1e9,
-        audio_tokens=speech_output.audio_tokens,
-        audio=speech_output.audio,
-        output_audio_path=speech_output.output_audio_path,
+        audio_tokens=audio_output.audio_tokens,
+        audio=audio_output.audio,
+        output_audio_path=audio_output.output_audio_path,
     )
 
 
@@ -4126,9 +4116,9 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    generate_audio = args.output_audio is not None
+    should_generate_audio = args.output_audio is not None
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
-    if generate_audio:
+    if should_generate_audio:
         chat_template_kwargs["use_tts_template"] = True
     if args.video:
         chat_template_kwargs["video"] = args.video
@@ -4242,8 +4232,8 @@ def main():
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
-        if generate_audio:
-            result = generate_speech(
+        if should_generate_audio:
+            result = generate_audio(
                 model,
                 processor,
                 prompt,
@@ -4262,7 +4252,7 @@ def main():
             )
         if not args.verbose:
             print(result.text)
-            if generate_audio and args.output_audio:
+            if should_generate_audio and args.output_audio:
                 print(f"Audio written to {args.output_audio}")
 
         if draft_model is not None:

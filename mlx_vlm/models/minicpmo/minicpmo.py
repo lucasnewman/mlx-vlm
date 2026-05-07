@@ -15,7 +15,7 @@ from .vision import VisionModel, check_array_shape
 
 
 @dataclass
-class MiniCPMOSpeechGenerationOutput:
+class MiniCPMOAudioGenerationOutput:
     audio_tokens: mx.array
     audio: Optional[bytes] = None
     output_audio_path: Optional[str] = None
@@ -599,7 +599,7 @@ class Model(nn.Module):
             raise ValueError("MiniCPM-o TTS module is not initialized.")
         if full_input_ids.shape[0] != 1:
             raise ValueError(
-                "MiniCPM-o speech generation currently supports batch size 1"
+                "MiniCPM-o audio generation currently supports batch size 1"
             )
 
         if tts_bound is None:
@@ -647,7 +647,7 @@ class Model(nn.Module):
             return audio
         return None
 
-    def generate_speech(
+    def generate_audio(
         self,
         *,
         input_ids: mx.array,
@@ -658,17 +658,11 @@ class Model(nn.Module):
         audio=None,
         output_audio_path: Optional[str] = None,
         ref_audio_path: Optional[str] = None,
-        min_tokens: int = 50,
-        max_tokens: int = 2048,
-        temperature: float = 0.8,
-        top_p: float = 0.85,
-        top_k: int = 25,
-        repetition_penalty: float = 1.05,
         **kwargs,
-    ) -> MiniCPMOSpeechGenerationOutput:
+    ) -> MiniCPMOAudioGenerationOutput:
         if input_ids.shape[0] != 1:
             raise ValueError(
-                "MiniCPM-o speech generation currently supports batch size 1"
+                "MiniCPM-o audio generation currently supports batch size 1"
             )
 
         if len(generated_tokens) == 0:
@@ -682,11 +676,13 @@ class Model(nn.Module):
                 axis=1,
             )
 
+        tts_min_tokens = kwargs.pop("tts_min_tokens", 50)
+        tts_max_tokens = kwargs.pop("tts_max_tokens", 2048)
         sampling_params = TTSSamplingParams(
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            temperature=temperature,
+            top_p=kwargs.pop("tts_top_p", 0.85),
+            top_k=kwargs.pop("tts_top_k", 25),
+            repetition_penalty=kwargs.pop("tts_repetition_penalty", 1.05),
+            temperature=kwargs.pop("tts_temperature", 0.8),
         )
         audio_tokens = self.generate_speech_tokens(
             full_input_ids,
@@ -695,8 +691,8 @@ class Model(nn.Module):
             tts_start_id=self._token_id(tokenizer, "tts_start_id", "<|tts_bos|>"),
             tts_end_id=self._token_id(tokenizer, "tts_end_id", "<|tts_eos|>"),
             tts_sampling_params=sampling_params,
-            tts_min_new_token=min_tokens,
-            tts_max_new_token=max_tokens,
+            tts_min_new_token=tts_min_tokens,
+            tts_max_new_token=tts_max_tokens,
             **kwargs,
         )
 
@@ -711,7 +707,7 @@ class Model(nn.Module):
                 output_audio_path=output_audio_path,
             )
 
-        return MiniCPMOSpeechGenerationOutput(
+        return MiniCPMOAudioGenerationOutput(
             audio_tokens=audio_tokens,
             audio=wav_bytes,
             output_audio_path=output_audio_path,

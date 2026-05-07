@@ -174,6 +174,55 @@ class TestMiniCPMOTTS(unittest.TestCase):
             np.array([[2, 4]], dtype=np.int32),
         )
 
+    def test_model_generate_audio_consumes_tts_kwargs(self):
+        from mlx_vlm.models.minicpmo.minicpmo import Model
+
+        class Tokenizer:
+            tts_start_id = 10
+            tts_end_id = 11
+
+            def convert_tokens_to_ids(self, token):
+                return {
+                    "<|tts_bos|>": self.tts_start_id,
+                    "<|tts_eos|>": self.tts_end_id,
+                }.get(token, -1)
+
+        model = Model.__new__(Model)
+        captured = {}
+
+        def generate_speech_tokens(full_input_ids, **kwargs):
+            captured["full_input_ids"] = full_input_ids
+            captured.update(kwargs)
+            return mx.zeros((1, 1, 1), dtype=mx.int32)
+
+        model.generate_speech_tokens = generate_speech_tokens
+        output = Model.generate_audio(
+            model,
+            input_ids=mx.array([[1, 2]], dtype=mx.int32),
+            generated_tokens=[3],
+            tokenizer=Tokenizer(),
+            tts_min_tokens=4,
+            tts_max_tokens=5,
+            tts_temperature=0.2,
+            tts_top_p=0.3,
+            tts_top_k=6,
+            tts_repetition_penalty=1.2,
+            max_tokens=99,
+        )
+
+        mx.eval(output.audio_tokens)
+        self.assertEqual(output.audio_tokens.shape, (1, 1, 1))
+        self.assertEqual(captured["tts_min_new_token"], 4)
+        self.assertEqual(captured["tts_max_new_token"], 5)
+        self.assertEqual(captured["tts_start_id"], 10)
+        self.assertEqual(captured["tts_end_id"], 11)
+        self.assertEqual(captured["max_tokens"], 99)
+        params = captured["tts_sampling_params"]
+        self.assertEqual(params.temperature, 0.2)
+        self.assertEqual(params.top_p, 0.3)
+        self.assertEqual(params.top_k, 6)
+        self.assertEqual(params.repetition_penalty, 1.2)
+
     def test_stepaudio2_vocoder_uses_codec_default_repo(self):
         from mlx_vlm.models.minicpmo.vocoder import StepAudio2Vocoder
 
