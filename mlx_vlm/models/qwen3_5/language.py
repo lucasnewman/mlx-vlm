@@ -495,19 +495,38 @@ class LanguageModel(nn.Module):
 
         q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
         A_log_list, dt_bias_list, state_list = [], [], []
+        layer_batch_sizes = []
         conv_data = []
         for j in range(N):
             q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
                 j
             ]
-            q_list.append(q[:, :n])
-            k_list.append(k[:, :n])
-            v_list.append(v[:, :n])
-            a_list.append(a[:, :n])
-            b_list.append(b[:, :n])
-            A_log_list.append(A_log[None, None, :])  # (1, 1, Hv)
-            dt_bias_list.append(dt_bias[None, None, :])  # (1, 1, Hv)
+            q = q[:, :n]
+            k = k[:, :n]
+            v = v[:, :n]
+            a = a[:, :n]
+            b = b[:, :n]
+            batch_rows = q.shape[0]
+            q_list.append(q)
+            k_list.append(k)
+            v_list.append(v)
+            a_list.append(a)
+            b_list.append(b)
+            A_log_list.append(
+                mx.broadcast_to(A_log[None, None, :], (batch_rows, 1, A_log.shape[0]))
+            )
+            dt_bias_list.append(
+                mx.broadcast_to(
+                    dt_bias[None, None, :], (batch_rows, 1, dt_bias.shape[0])
+                )
+            )
+            if init_state is None:
+                init_state = mx.zeros(
+                    (batch_rows, v.shape[-2], v.shape[-1], k.shape[-1]),
+                    dtype=mx.float32,
+                )
             state_list.append(init_state)
+            layer_batch_sizes.append(batch_rows)
             conv_data.append((conv_input, K))
             if not is_batch and replay_mask is None and mask is not None:
                 replay_mask = mask[:, :n]
@@ -522,8 +541,13 @@ class LanguageModel(nn.Module):
         dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
         state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
 
-        if replay_mask is not None and replay_mask.shape[0] == 1 and N > 1:
-            replay_mask = mx.broadcast_to(replay_mask, (N, n))
+        if replay_mask is not None and replay_mask.shape[0] != q_bat.shape[0]:
+            if q_bat.shape[0] % replay_mask.shape[0] != 0:
+                raise ValueError(
+                    "Replay mask batch does not align with flattened SSM rollback rows."
+                )
+            repeats = q_bat.shape[0] // replay_mask.shape[0]
+            replay_mask = mx.concatenate([replay_mask] * repeats, axis=0)
 
         _, states_out = gated_delta_update(
             q_bat,
@@ -540,8 +564,11 @@ class LanguageModel(nn.Module):
 
         # Scatter results back to individual caches.
         a0 = int(accepted[0].item()) if not is_batch else None
+        state_offset = 0
         for j, c in enumerate(ssm_caches):
-            c[1] = states_out[j : j + 1]
+            batch_rows = layer_batch_sizes[j]
+            c[1] = states_out[state_offset : state_offset + batch_rows]
+            state_offset += batch_rows
             conv_input, K = conv_data[j]
             if is_batch:
                 acc_list = accepted.tolist()
@@ -698,7 +725,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -706,11 +733,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -785,19 +811,18 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
                     offsets = cache_offsets[:batch_size]
-                    rope_deltas = (
-                        rope_deltas_kw
-                        if rope_deltas_kw is not None
-                        else self._rope_deltas
-                    )
+                    rope_deltas = rope_deltas_src
                     if rope_deltas.shape[0] > batch_size:
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]
                 else:
                     delta = mx.array(
-                        cache_offset + self._rope_deltas if cache is not None else 0
+                        cache_offset + rope_deltas_src if cache is not None else 0
                     )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
