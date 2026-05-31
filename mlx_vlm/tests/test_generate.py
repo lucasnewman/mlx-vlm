@@ -1481,6 +1481,229 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def _exercise_stream_generate_template(
+    prompt,
+    image=None,
+    audio=None,
+    video=None,
+    model_type="gemma4",
+    processor_chat_template="template",
+    tokenizer_chat_template=None,
+    skip_template=False,
+    skip_chat_template=False,
+    **kwargs,
+):
+    captured = {}
+
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        def reset(self):
+            self.segments = []
+
+        def add_token(self, token, skip_special_token_ids=None):
+            self.segments.append(str(token))
+
+        @property
+        def last_segment(self):
+            return self.segments.pop(0) if self.segments else ""
+
+        def finalize(self):
+            pass
+
+    def fake_prepare_inputs(
+        processor,
+        images,
+        audio,
+        videos,
+        prompts,
+        image_token_index,
+        resize_shape,
+        add_special_tokens,
+        **kwargs,
+    ):
+        captured["images"] = images
+        captured["audio"] = audio
+        captured["videos"] = videos
+        captured["prompts"] = prompts
+        captured["prepare_kwargs"] = kwargs
+        return {
+            "input_ids": mx.array([[1]], dtype=mx.int32),
+            "attention_mask": mx.ones((1, 1), dtype=mx.int32),
+            "pixel_values": None,
+        }
+
+    def fake_generate_step(*args, **kwargs):
+        captured["generate_step_kwargs"] = kwargs
+        yield 7, mx.zeros((4,))
+
+    tokenizer = SimpleNamespace(
+        all_special_tokens=["<bos>", "<image>", "<audio>"],
+        chat_template=tokenizer_chat_template,
+        stopping_criteria=FakeStoppingCriteria(),
+    )
+    processor = SimpleNamespace(
+        tokenizer=tokenizer,
+        detokenizer=FakeDetokenizer(),
+        chat_template=processor_chat_template,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type=model_type,
+            eos_token_id=[],
+            image_token_index=32000,
+        ),
+        language_model=SimpleNamespace(),
+    )
+    stream_kwargs = {"prompt_cache": [], "max_tokens": 1, **kwargs}
+    if skip_template:
+        stream_kwargs["_skip_template"] = True
+    if skip_chat_template:
+        stream_kwargs["skip_chat_template"] = True
+
+    with (
+        patch.object(
+            dispatch_module,
+            "apply_chat_template",
+            return_value="templated prompt",
+        ) as mock_apply_template,
+        patch.object(
+            dispatch_module, "prepare_inputs", side_effect=fake_prepare_inputs
+        ),
+        patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt=prompt,
+                image=image,
+                audio=audio,
+                video=video,
+                **stream_kwargs,
+            )
+        )
+
+    return captured, mock_apply_template
+
+
+def test_stream_generate_applies_chat_template_to_raw_media_prompt():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "What is in this image?",
+        image=["image.png"],
+        processor_chat_template=None,
+    )
+
+    mock_apply_template.assert_called_once()
+    assert mock_apply_template.call_args.args[2] == "What is in this image?"
+    assert mock_apply_template.call_args.kwargs["num_images"] == 1
+    assert mock_apply_template.call_args.kwargs["num_audios"] == 0
+    assert mock_apply_template.call_args.kwargs["enable_thinking"] is False
+    assert captured["prompts"] == "templated prompt"
+
+
+def test_stream_generate_applies_chat_template_to_raw_text_prompt_with_processor_template():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "Say hello in one sentence.",
+        model_type="llava",
+    )
+
+    mock_apply_template.assert_called_once()
+    assert mock_apply_template.call_args.args[2] == "Say hello in one sentence."
+    assert mock_apply_template.call_args.kwargs["num_images"] == 0
+    assert mock_apply_template.call_args.kwargs["num_audios"] == 0
+    assert captured["prompts"] == "templated prompt"
+
+
+def test_stream_generate_applies_chat_template_to_raw_text_prompt_with_tokenizer_template():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "Say hello in one sentence.",
+        model_type="llava",
+        processor_chat_template=None,
+        tokenizer_chat_template="template",
+    )
+
+    mock_apply_template.assert_called_once()
+    assert mock_apply_template.call_args.args[2] == "Say hello in one sentence."
+    assert captured["prompts"] == "templated prompt"
+
+
+def test_stream_generate_does_not_template_raw_text_prompt_without_chat_template():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "Say hello in one sentence.",
+        model_type="llava",
+        processor_chat_template=None,
+    )
+
+    mock_apply_template.assert_not_called()
+    assert captured["prompts"] == "Say hello in one sentence."
+
+
+def test_stream_generate_does_not_template_prompt_with_special_token():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "<bos><image> What is in this image?",
+        image=["image.png"],
+    )
+
+    mock_apply_template.assert_not_called()
+    assert captured["prompts"] == "<bos><image> What is in this image?"
+
+
+def test_stream_generate_skip_template_opt_out_is_not_forwarded():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "What is in this image?",
+        image=["image.png"],
+        skip_template=True,
+    )
+
+    mock_apply_template.assert_not_called()
+    assert captured["prompts"] == "What is in this image?"
+    assert "_skip_template" not in captured["prepare_kwargs"]
+    assert "_skip_template" not in captured["generate_step_kwargs"]
+
+
+def test_stream_generate_skip_chat_template_alias_is_not_forwarded():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "Say hello in one sentence.",
+        skip_chat_template=True,
+    )
+
+    mock_apply_template.assert_not_called()
+    assert captured["prompts"] == "Say hello in one sentence."
+    assert "skip_chat_template" not in captured["prepare_kwargs"]
+    assert "skip_chat_template" not in captured["generate_step_kwargs"]
+
+
+def test_stream_generate_counts_audio_when_auto_templating():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "Transcribe this.",
+        audio=["clip.wav"],
+    )
+
+    mock_apply_template.assert_called_once()
+    assert mock_apply_template.call_args.kwargs["num_images"] == 0
+    assert mock_apply_template.call_args.kwargs["num_audios"] == 1
+    assert captured["prompts"] == "templated prompt"
+
+
+def test_stream_generate_passes_video_context_when_auto_templating():
+    captured, mock_apply_template = _exercise_stream_generate_template(
+        "Describe the video.",
+        video=["clip.mp4"],
+        fps=1.5,
+    )
+
+    mock_apply_template.assert_called_once()
+    assert mock_apply_template.call_args.kwargs["num_images"] == 0
+    assert mock_apply_template.call_args.kwargs["num_audios"] == 0
+    assert mock_apply_template.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_apply_template.call_args.kwargs["fps"] == pytest.approx(1.5)
+    assert captured["videos"] == ["clip.mp4"]
+    assert captured["prompts"] == "templated prompt"
+
+
 def test_normalize_resize_shape_expands_single_value():
     assert normalize_resize_shape([224]) == (224, 224)
 

@@ -606,6 +606,40 @@ def is_masked_diffusion_text_model(model: nn.Module) -> bool:
     return getattr(config, "mask_token_id", None) is not None
 
 
+def _count_media_items(media: Any) -> int:
+    if media is None:
+        return 0
+    return len(media) if isinstance(media, (list, tuple)) else 1
+
+
+def _prompt_has_template_marker(prompt: Any, tokenizer: Any) -> bool:
+    special_tokens = [
+        token
+        for token in getattr(tokenizer, "all_special_tokens", []) or []
+        if isinstance(token, str) and len(token) > 1
+    ]
+    if not special_tokens:
+        return False
+
+    def contains_marker(value: Any) -> bool:
+        if isinstance(value, str):
+            return any(token in value for token in special_tokens)
+        if isinstance(value, dict):
+            return any(contains_marker(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_marker(item) for item in value)
+        return False
+
+    return contains_marker(prompt)
+
+
+def _has_chat_template(processor: Any, tokenizer: Any) -> bool:
+    return (
+        getattr(processor, "chat_template", None) is not None
+        or getattr(tokenizer, "chat_template", None) is not None
+    )
+
+
 def _prime_cached_prefix_rope_state(
     model: nn.Module,
     full_input_ids: mx.array,
@@ -708,6 +742,9 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
+    skip_template = kwargs.pop("_skip_template", False) or kwargs.pop(
+        "skip_chat_template", False
+    )
     image = image or None
     audio = audio or None
     video = video or None
@@ -717,6 +754,26 @@ def stream_generate(
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
     else:
+        has_media = image is not None or audio is not None or video is not None
+        if (
+            not skip_template
+            and (has_media or _has_chat_template(processor, tokenizer))
+            and not _prompt_has_template_marker(prompt, tokenizer)
+        ):
+            chat_template_kwargs = {"enable_thinking": enable_thinking}
+            if video is not None:
+                chat_template_kwargs["video"] = video
+                if "fps" in kwargs:
+                    chat_template_kwargs["fps"] = kwargs["fps"]
+            prompt = apply_chat_template(
+                processor,
+                model.config,
+                prompt,
+                num_images=_count_media_items(image),
+                num_audios=_count_media_items(audio),
+                **chat_template_kwargs,
+            )
+
         inputs = prepare_inputs(
             processor,
             images=image,
