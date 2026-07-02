@@ -382,6 +382,10 @@ def get_model_and_args(config: dict):
         raise KeyError("model_type")
     model_type = raw_model_type.lower()
 
+    if _is_nemotron_h_twotower_config(config):
+        arch = importlib.import_module("mlx_vlm.models.nemotron_h_twotower")
+        return arch, "nemotron_h_twotower"
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     is_dflash = config.get("dflash_config", None) is not None
@@ -411,6 +415,16 @@ def get_model_and_args(config: dict):
 def _has_config(config: dict, key: str) -> bool:
     value = config.get(key)
     return value is not None and value != {}
+
+
+def _is_nemotron_h_twotower_config(config: dict) -> bool:
+    architectures = config.get("architectures") or []
+    if "NemotronHTwoTowerForCausalLM" in architectures:
+        return True
+
+    auto_map = config.get("auto_map") or {}
+    auto_model = auto_map.get("AutoModelForCausalLM") or auto_map.get("AutoModel")
+    return isinstance(auto_model, str) and "modeling_nemotron_twotower" in auto_model
 
 
 def _is_text_only_config(config: dict) -> bool:
